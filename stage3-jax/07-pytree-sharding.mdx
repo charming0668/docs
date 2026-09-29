@@ -1,10 +1,106 @@
 ---
 title: '第 7 章：PyTree 结构与 SPMD 分布式分片'
-description: 'JAX 数据结构抽象与 NamedSharding 优雅并行实践'
+description: '解密 JAX 的 PyTree 容器递归抽象与基于 Mesh / NamedSharding 的优雅张量切分'
 ---
 
-本章节正在系统撰写中，敬请期待！
+在真实的大规模深度学习工程中，模型权重绝不是单一的扁平数组，而是由层级模块组成的树状字典；同样，训练超大模型也绝不能局限于单卡，必须分布在多卡集群上。JAX 用 **PyTree** 与 **SPMD（单程序多数据）分片系统** 提供了极其优美的数学解答。
 
-<Note>
-第一阶段第 1 章已完整上线，欢迎优先阅读：[第 1 章：张量与显存物理现实](/stage1-foundations/01-tensor-memory)。
-</Note>
+---
+
+## 1. 深度学习的数据容器抽象：什么是 PyTree？
+
+在 JAX 中，**PyTree（Python Tree）** 是指任意由 Python 容器（字典 dict、列表 list、元组 tuple）层级嵌套构成的树状数据结构。树的叶子节点（Leaves）通常是 `jax.Array` 或基础数值标量。
+
+在 JAX 中，一个完整的神经网络模型权重，本质上就是一个标准的 PyTree：
+
+```python
+params = {
+    "encoder": {
+        "layer_0": {"w": jnp.ones((8, 8)), "b": jnp.zeros(8)},
+        "layer_1": {"w": jnp.ones((8, 8)), "b": jnp.zeros(8)}
+    },
+    "decoder": {
+        "head": {"w": jnp.ones((8, 2))}
+    }
+}
+```
+
+### 1.1 jax.tree.map：一行代码操作整座模型大厦
+
+如果想对模型里的所有参数做梯度下降更新、权重衰减或梯度裁剪，在 PyTorch 中需要手动写繁杂的遍历循环。而在 JAX 中，只需要使用 `jax.tree.map` 即可将一个函数递归映射到所有叶子张量上：
+
+```python
+import jax
+
+learning_rate = 0.01
+
+# 一行实现梯度更新：params = params - lr * grads
+# tree.map 会自动严格校验 params 与 grads 的树形拓扑结构完全一致
+updated_params = jax.tree.map(
+    lambda p, g: p - learning_rate * g,
+    params,
+    grads
+)
+
+# 一行计算全模型所有参数的总范数 (Global Norm)
+param_norm = jnp.sqrt(sum(
+    jax.tree.leaves(jax.tree.map(lambda x: jnp.sum(x ** 2), params))
+))
+```
+
+---
+
+## 2. 现代 JAX 分布式分片：NamedSharding 与 Mesh
+
+传统 PyTorch 分布式（如 DDP / FSDP）需要显式初始化进程组、管理通信器与手动划分模型。而 JAX 引入了划时代的 **SPMD 张量分片系统（NamedSharding）**，让分布式编程像在单卡上写单机数组一样自然！
+
+```
+物理设备拓扑 (2x4 GPU 集群)
+       ┌────────────────────────┐
+       │   Mesh(devices, ('x', 'y'))
+       │                        │
+       │   GPU 0  GPU 1  GPU 2  GPU 3   (mesh 轴 'y': 模型并行/张量分片)
+       │   GPU 4  GPU 5  GPU 6  GPU 7  
+       └────────────────────────┘
+                    ▲
+                    │ (mesh 轴 'x': 数据并行分片)
+```
+
+### 2.1 分布式三大要素
+1. **Mesh（设备网格）**：将物理可用的多张 GPU 抽象为一个带有逻辑坐标轴（如 `data` 轴、`model` 轴）的高维阵列。
+2. **PartitionSpec（分区规则）**：定义张量的每一个维度分别对应挂载到 Mesh 的哪一个轴上。未指定的维度则默认在多卡上全量复制（Replicated）。
+3. **NamedSharding（命名分片描述符）**：结合 Mesh 与 PartitionSpec，赋予张量明确的多卡物理分布属性。
+
+### 2.2 实战：一行声明数据并行与张量切分
+
+```python
+import jax
+from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
+
+# 假设当前环境有 8 张可用 GPU
+devices = jax.devices()
+# 构建 2x4 的设备逻辑网格
+mesh = Mesh(devices.reshape(2, 4), axis_names=("data", "model"))
+
+# 规则 1：数据并行分片 (Batch 轴沿 'data' 切分，特征轴在多卡间完整保留)
+data_sharding = NamedSharding(mesh, P("data", None))
+
+# 规则 2：模型全分片 (FSDP 风格：沿 'data' 和 'model' 双重切分权重)
+weight_sharding = NamedSharding(mesh, P("data", "model"))
+
+# 制造或分配分片张量
+x = jax.device_put(jnp.ones((128, 512)), data_sharding)
+print("张量全局形状:", x.shape)
+print("各设备独立持有的物理切片形状:", x.addressable_shards[0].data.shape)
+```
+
+**编译器接管通信**：
+在 JIT 函数内部，当不同分片属性的张量相乘时，**XLA 编译器会自动推导出需要在卡间插入哪种通信原语（All-Gather、Reduce-Scatter 还是 All-to-All）**，无需开发者手动调用任何 MPI 或 NCCL 通信代码！
+
+---
+
+## 本章小结
+
+1. **PyTree** 将深度学习模型统一抽象为通用的树状结构，`jax.tree.map` 极大简化了全局状态更新；
+2. JAX 分布式基于 **SPMD + Mesh + NamedSharding**，以纯声明式方式定义张量在硬件网格上的布局；
+3. 底层多卡集合通信完全由 XLA 编译器按需自动生成，实现了极高的分布式开发效率。

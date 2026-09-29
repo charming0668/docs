@@ -1,10 +1,125 @@
 ---
 title: '第 6 章：JAX 核心函数变换体系'
-description: 'JIT、Grad、Vmap 与 Scan 的组合艺术与 XLA 编译流水线'
+description: '深入 JIT、Grad、Vmap 与 Scan 四大高阶函数变换的组合艺术与 XLA 编译优化'
 ---
 
-本章节正在系统撰写中，敬请期待！
+JAX 之所以被称为“可微编程的代数系统”，就在于其核心的 **四大函数变换（The Big Four）**。它们每一个都是纯数学意义上的高阶算子（Higher-Order Function），接收一个纯函数，返回一个被赋予全新能力的增强函数。
 
-<Note>
-第一阶段第 1 章已完整上线，欢迎优先阅读：[第 1 章：张量与显存物理现实](/stage1-foundations/01-tensor-memory)。
-</Note>
+---
+
+## 1. jax.jit：XLA 即时编译流水线
+
+`jax.jit`（Just-In-Time Compilation）是 JAX 性能的核心引擎。
+
+### 1.1 追踪（Tracing）与特化（Specialization）
+当对一个函数加上 `@jax.jit` 后：
+1. **初次调用（Trace 阶段）**：JAX 不直接运行你的真实浮点数，而是向函数注入 **抽象追踪器（Tracer）**。Tracer 只记录数组的**形状（Shape）**和**数据类型（Dtype）**，沿途捕获所有的 JAX 原语算子，生成抽象计算图 JAXPR。
+2. **底层编译（Compile 阶段）**：XLA 将 JAXPR 编译为针对 GPU / TPU 架构高度优化的机器内核代码，完成深度算子融合（Operator Fusion）与死代码消除。
+3. **后续调用（Execute 阶段）**：直接向编译好的内核喂入数据，绕过 Python 解释器。
+
+### 1.2 static_argnums 与动态控制流
+如果函数的某个参数直接决定了内部 Python 控制流或张量输出形状，该参数不能被 Trace，必须显式声明为静态参数：
+
+```python
+import jax
+import jax.numpy as jnp
+
+# mode 决定了是否执行某个分支，必须标记为静态常量
+@jax.jit(static_argnames=["mode"])
+def dynamic_step(x, w, mode="train"):
+    out = jnp.dot(x, w)
+    if mode == "train":
+        return out * 0.9 # 例如 Dropout
+    else:
+        return out
+```
+
+---
+
+## 2. jax.grad 与 value_and_grad：函数式求导
+
+在训练循环中，最推荐的实战写法是 `jax.value_and_grad`，一次前向同时获取损失值和梯度：
+
+```python
+def compute_loss(params, x, y):
+    pred = jnp.dot(x, params["w"]) + params["b"]
+    return jnp.mean((pred - y) ** 2)
+
+# 生成同时返回 (loss, grads) 的函数
+loss_and_grad_fn = jax.value_and_grad(compute_loss)
+
+# 直接调用
+loss_val, grads = loss_and_grad_fn(params, x_batch, y_batch)
+```
+
+---
+
+## 3. jax.vmap：消除手写 Batch 维度的魔法
+
+在传统 PyTorch 中，编写网络必须处处考虑 Batch 维度，使用 `unsqueeze`、`expand` 或复杂的矩阵广播。而在 JAX 中，你可以**只为“单条数据（Single Instance）”写最简洁的逻辑**，然后用 `vmap` 一键将其批量化！
+
+```python
+# 编写两个一维向量的点积（仅针对单条样本）
+def single_dot(v1, v2):
+    return jnp.dot(v1, v2)
+
+# 使用 vmap 自动升维：
+# in_axes=(0, 0) 表示 v1 和 v2 都沿着各自的第 0 维（Batch 轴）切分并并行映射
+batch_dot = jax.vmap(single_dot, in_axes=(0, 0))
+
+# 自动处理任意形状的 Batch：
+batch_v1 = jnp.ones((64, 128))
+batch_v2 = jnp.ones((64, 128))
+result = batch_dot(batch_v1, batch_v2) # 输出形状: (64,)
+```
+
+---
+
+## 4. jax.lax.scan：高效序列循环，解决编译时间爆炸
+
+在处理长序列（如 RNN 步进、自回归大模型解码、扩散模型 Diffusion 采样迭代）时，如果在 JIT 内部写普通 Python `for` 循环：
+```python
+# 危险写法：XLA 编译器会执行循环完全展开（Loop Unroll）
+# 如果循环 1000 次，计算图将膨胀 1000 倍，导致 JIT 编译耗时几分钟甚至内存溢出！
+for i in range(1000):
+    state = step_fn(state, x[i])
+```
+
+**终极解决方案：`jax.lax.scan`**
+XLA 会将 `lax.scan` 编译为一个单一的高性能硬件底层循环原语：
+
+```python
+import jax.lax as lax
+
+def step_fn(carry_state, x_t):
+    # carry_state 为在步骤间流转的累积状态
+    # x_t 为当前时刻的输入序列切片
+    new_state = carry_state + x_t
+    output = new_state * 2
+    return new_state, output
+
+init_state = 0.0
+sequence = jnp.array([1.0, 2.0, 3.0, 4.0, 5.0])
+
+# 一行搞定高性能硬件循环
+final_state, all_outputs = lax.scan(step_fn, init_state, sequence)
+```
+
+---
+
+## 5. 组合的威力：任意嵌套与自由组合
+
+JAX 变换的最强之处在于**完全可任意组合（Composability）**：
+```python
+# 组合范例：先并行升维批处理，再求梯度，最后 JIT 全图编译！
+fast_batch_grad_fn = jax.jit(jax.vmap(jax.grad(single_loss_fn)))
+```
+
+---
+
+## 本章小结
+
+1. `jax.jit` 依赖 Tracer 生成 JAXPR 并交由 XLA 融合编译，静态参数需显式指定；
+2. `jax.value_and_grad` 是训练循环求导的首选；
+3. `jax.vmap` 允许只编写单样本逻辑并自动向量化，彻底告别复杂的维度切片；
+4. `jax.lax.scan` 是长序列与多步迭代推理的编译性能救星。

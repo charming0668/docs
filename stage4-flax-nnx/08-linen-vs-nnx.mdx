@@ -1,10 +1,88 @@
 ---
 title: '第 8 章：传统 Linen 痛点与设计反思'
-description: '参数与结构彻底分离的心智负担与迁移阻力分析'
+description: '剖析传统 Flax Linen 架构中参数与结构彻底割裂的认知负担与迁移阻力'
 ---
 
-本章节正在系统撰写中，敬请期待！
+在学习现代 JAX 生态时，大多数开发者会先接触到 Google 官方推出的经典网络库 **Flax (Linen API)**。然而，许多从 PyTorch 迁移而来的工程师在初学 Linen 时都会感到极度不适。本章直面 Linen 的设计哲学与实际痛点。
 
-<Note>
-第一阶段第 1 章已完整上线，欢迎优先阅读：[第 1 章：张量与显存物理现实](/stage1-foundations/01-tensor-memory)。
-</Note>
+---
+
+## 1. 传统 Linen 的核心心智模型：极致的纯函数分离
+
+在 Linen 的世界里，**类（Module）不持有任何权重数据**。Module 仅仅是一个“代码模具（Blueprint）”，用来描述计算逻辑。
+
+```python
+from flax import linen as nn
+import jax
+import jax.numpy as jnp
+
+class LinenMLP(nn.Module):
+    features: int
+
+    @nn.compact
+    def __call__(self, x):
+        # 这里的 Dense 只是一个声明，没有权重存储在其内部！
+        x = nn.Dense(self.features)(x)
+        return nn.relu(x)
+```
+
+### 1.1 割裂的两阶段运行生命周期
+运行上述模型，必须经历两个完全独立的阶段：
+
+1. **初始化阶段（`init`）**：传入 Dummy 数据和随机种子，由框架探测各层形状并返回一个包含所有权重的字典 `variables`：
+   ```python
+   model = LinenMLP(features=10)
+   key = jax.random.key(0)
+   dummy_x = jnp.ones((1, 4))
+
+   # 必须显式拿到这个包含权重的外部字典！
+   variables = model.init(key, dummy_x)
+   print("外部存储的参数结构:", variables.keys()) # dict_keys(['params'])
+   ```
+
+2. **前向执行阶段（`apply`）**：在随后的任何前向计算或求导中，都必须同时传递 `variables` 和真实数据：
+   ```python
+   # 无法直接像 model(x) 这样调用，必须显式调用 apply 并灌入参数字典
+   out = model.apply(variables, dummy_x)
+   ```
+
+---
+
+## 2. 为什么 Linen 让开发者苦不堪言？四大工程痛点
+
+### 痛点 1：数据与行为的彻底割裂
+面向对象的核心原则是“高内聚”：对象同时封装自身的数据（状态）与针对该数据的行为（方法）。而 Linen 将数据强行剥离到外部的嵌套字典中，导致在大型工程中调试模型时，难以直观追踪某个子模块的权重变化。
+
+### 痛点 2：非参数状态（Batch Normalization 等）的维护极其繁重
+如果模型包含 BatchNorm 或 Dropout 等有状态操作，`apply` 的语法变得异常复杂冗长：
+```python
+# 必须显式声明可变集合 mutable=['batch_stats']，并手动接收返回的新状态！
+new_out, mutables = model.apply(
+    variables,
+    x,
+    mutable=['batch_stats'],
+    rngs={'dropout': dropout_key}
+)
+variables = {**variables, 'batch_stats': mutables['batch_stats']}
+```
+
+### 痛点 3：缺乏模块化组合与动态重构能力
+在 PyTorch 中，为预训练模型替换分类头或冻结某些层非常直观：
+```python
+# PyTorch 的直观面向对象操作
+model.classifier = nn.Linear(512, 10)
+for param in model.backbone.parameters():
+    param.requires_grad = False
+```
+而在 Linen 中，你必须写复杂的字典遍历、Path 过滤与正则表达式来裁剪和拼接两套结构完全不同的 `variables` 字典！
+
+### 痛点 4：陡峭的心智转换成本
+PyTorch 开发者早已习惯了以模块对象为中心思考。Linen 的无状态要求强行制造了一道极高的人为认知门槛，直接导致许多团队在评估迁移到 JAX 时望而却步。
+
+---
+
+## 本章小结
+
+1. Flax Linen 追求极致的纯函数数学纯洁性，强行将**模型结构（Module）**与**权重状态（Variables）**分离；
+2. 这种两阶段设计（`init` + `apply`）带来了状态更新繁琐、冻结与裁剪层困难等巨大工程负担；
+3. 正是这些无法回避的生产痛点，催生了新一代架构 —— **Flax NNX**。

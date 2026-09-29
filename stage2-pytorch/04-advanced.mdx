@@ -1,10 +1,111 @@
 ---
 title: '第 4 章：PyTorch 进阶编译与分布式'
-description: 'torch.compile 原理、梯度检查点、混合精度与 DDP 通信'
+description: '解密 torch.compile 架构、Inductor 编译器、显存优化技术与 DDP 分布式通信'
 ---
 
-本章节正在系统撰写中，敬请期待！
+从单卡研究原型走向千亿大模型与工业级生产集群，必须跨过两道坎：**深度编译器加速（torch.compile）** 与 **大规模分布式并行（DistributedDataParallel）**。
 
-<Note>
-第一阶段第 1 章已完整上线，欢迎优先阅读：[第 1 章：张量与显存物理现实](/stage1-foundations/01-tensor-memory)。
-</Note>
+---
+
+## 1. PyTorch 2.0 编译革命：torch.compile 底层原理
+
+在 2.0 之前，PyTorch 的核心优势是 Eager 动态图易调试，但劣势是单算子发射（Per-operator dispatch）导致严重的显存带宽瓶颈。`torch.compile` 的诞生彻底改变了这一格局。
+
+```
+Python 源码
+    │
+    ▼ [ TorchDynamo ]  (字节码级动态 JIT 编译器，提取计算图，处理控制流与分界点)
+FX Graph (统一计算图表达)
+    │
+    ▼ [ AOTAutograd ]  (提前生成反向传播的静态计算图，避免运行时动态跟踪)
+AOT FX Graph
+    │
+    ▼ [ TorchInductor ] (高性能后端编译器，自动生成 Triton / C++ 内核代码)
+融合后的高性能 GPU 机器代码 (Zero-overhead Kernel Fusion)
+```
+
+### 1.1 三大核心组件解析
+1. **TorchDynamo**：利用 CPython 的 Frame Evaluation API，直接在字节码层面拦截 Python 执行流，提取纯张量计算图。当遇到无法捕获的复杂第三方代码时，支持安全的 **图分界（Graph Break）**，退回到 Eager 模式执行，兼顾灵活性与性能。
+2. **AOTAutograd**：在编译期提前“前瞻”反向图，将前向和反向都编译为静态的 FX Graph。
+3. **TorchInductor**：深度代码生成引擎，针对 NVIDIA GPU 自动生成原生的 **Triton 算子代码**，将多个访存密集型算子无缝融合成单一 GPU Kernel。
+
+```python
+import torch
+
+model = MyLargeModel().cuda()
+# 一行代码开启深度全图编译与算子融合
+compiled_model = torch.compile(model, mode="reduce-overhead")
+```
+
+---
+
+## 2. 极致显存优化技术
+
+在大模型与超长上下文训练中，单卡显存往往是第一瓶颈。
+
+### 2.1 梯度检查点（Gradient Checkpointing）
+以时间换空间的极致技术：
+- **普通训练**：前向传播保存所有中间激活值，反向传播直接复用，显存占用与网络深度成正比；
+- **Checkpointing**：前向传播丢弃绝大多数中间激活值，只保留分界点状态；反向传播需要用到某一段激活值时，**重新执行该段前向计算**！
+- **收益**：显存消耗从 $O(N)$ 降至 $O(sqrt{N})$，仅增加约 20%~30% 的前向重算时间。
+
+```python
+from torch.utils.checkpoint import checkpoint
+
+def forward_step(self, x):
+    # 使用 checkpoint 包装耗费大显存的复杂模块
+    return checkpoint(self.heavy_layer, x, use_reentrant=False)
+```
+
+### 2.2 自动混合精度（AMP）与 GradScaler
+在 FP16 / BF16 精度下，参数更新容易发生数值下溢（Underflow）。
+- **BF16**：具有与 FP32 完全相同的指数位范围（8-bit 指数），通常无需 Scaler；
+- **FP16**：必须配合 `torch.cuda.amp.GradScaler` 动态缩放 Loss，防止微小梯度归零。
+
+```python
+scaler = torch.cuda.amp.GradScaler()
+
+for x, y in dataloader:
+    optimizer.zero_grad(set_to_none=True)
+    with torch.autocast(device_type="cuda", dtype=torch.float16):
+        loss = model(x, y)
+    
+    # 缩放 Loss 并反向传播
+    scaler.scale(loss).backward()
+    scaler.step(optimizer)
+    scaler.update()
+```
+
+---
+
+## 3. 分布式并行基石：DistributedDataParallel (DDP)
+
+在单机多卡与多机集群中，数据并行（Data Parallel）是最成熟、最高效的范式。
+
+### 3.1 为什么禁用 DataParallel (DP)？
+- `torch.nn.DataParallel`：单进程多线程模式，受限于 Python 全局解释器锁（GIL）；由主卡向各卡分发参数并收集梯度，主卡显存负载严重失衡，扩展性差。
+- `torch.nn.parallel.DistributedDataParallel`：**多进程单卡（1 Process per GPU）**模式，独立运行，卡间通过 NCCL 通信原语进行 Ring-AllReduce，通信与计算高度重叠（Overlap）。
+
+### 3.2 DDP 通信核心：Bucket 与 Ring-AllReduce
+
+```
+GPU 0 梯度计算完成 ──┐
+GPU 1 梯度计算完成 ──┼──► 打包成 Buckets (默认 25MB) ──► 异步 Ring-AllReduce 全规约平均
+GPU 2 梯度计算完成 ──┘
+```
+
+在 DDP 中，反向传播并未等待所有层全部计算完才发起通信。而是由一个分桶机制（Bucketing），当某些层的梯度体积累计达到一个桶的大小时，立即在后台异步发起 NCCL 通信，**将梯度通信时间完全掩盖在反向计算过程中**！
+
+### 3.3 标准启动范式（torchrun）
+```bash
+# 单节点 8 卡训练启动命令
+torchrun --standalone --nproc_per_node=8 train.py --config=configs/base.yaml
+```
+
+---
+
+## 本章小结
+
+1. `torch.compile` 通过 Dynamo + AOTAutograd + Inductor 实现了不牺牲 Eager 灵活性的静态全图融合编译；
+2. 显存受限时，首选 Gradient Checkpointing（重算换显存）与 BF16/FP16 混合精度；
+3. 大规模生产环境必须使用基于多进程 NCCL 的 DDP，利用 Bucketing 机制实现通信与计算的高效重叠。

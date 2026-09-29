@@ -1,10 +1,169 @@
 ---
 title: '第 2 章：自动微分与计算图本质'
-description: '剖析动态图反向传播与函数式微分算子的数学本质'
+description: '深入剖析动态计算图、雅可比向量积（VJP）与函数式微分算子的数学本质'
 ---
 
-本章节正在系统撰写中，敬请期待！
+现代深度学习框架的核心灵魂是**自动微分（Automatic Differentiation, AD）**。然而，许多开发者常将“数值微分（有限差分）”、“符号微分（代数公式推导）”与“自动微分”混为一谈，也不清楚 PyTorch 的 Tape-based 动态图机制与 JAX 的函数变换式微分在底层计算上的根本差异。
 
-<Note>
-第一阶段第 1 章已完整上线，欢迎优先阅读：[第 1 章：张量与显存物理现实](/stage1-foundations/01-tensor-memory)。
-</Note>
+---
+
+## 1. 三种微分机制对比
+
+在计算机中求解导数，主要有三种完全不同的途径：
+
+| 微分范式 | 实现机制 | 优势 | 致命缺陷 |
+| :--- | :--- | :--- | :--- |
+| **数值微分 (Numerical Diff)** | 有限差分近似：(f(x + ε) - f(x)) / ε | 无需解析源码，黑盒可用 | 精度受截断/舍入误差影响；高维参数需进行 N 次前向计算，极其缓慢 |
+| **符号微分 (Symbolic Diff)** | 代数公式化简（如 SymPy、Mathematica） | 获取完全精确的解析数学表达式 | 表达式膨胀（Expression Swell），无法处理包含复杂循环与分支控制流的代码 |
+| **自动微分 (AutoDiff)** | 利用链式法则，在程序执行或编译期分解基本算子，精准累积梯度 | 达到浮点数理论精度的同时，反向传播开销仅约为前向计算的 2~3 倍 | 需要框架运行时追踪计算历史或通过 AST/IR 进行静态变换 |
+
+---
+
+## 2. 反向传播的数学真实：为什么是 VJP 而不是全量雅可比矩阵？
+
+对于网络层输出向量 y (维数为 M) 关于输入向量 x (维数为 N) 的导数，数学上定义为 M × N 的**雅可比矩阵（Jacobian Matrix, J）**：
+
+```
+J_ij = ∂y_i / ∂x_j
+```
+
+在深度学习中，标量损失标为 L。根据多元微积分链式法则：
+
+```
+∂L / ∂x = (∂L / ∂y) × J
+```
+
+其中：
+- ∂L / ∂y 是一个 1 × M 的行向量（反向传播传递过来的梯度，称为 cotangent 向量 v）。
+- J 是一个 M × N 的庞大矩阵。
+
+### 显存杀手：绝对不能显式物化 J
+假设全连接层输入向量维度 N = 4096，输出向量维度 M = 4096。
+若显式计算并存储雅可比矩阵 J，将包含 4096 × 4096 ≈ 16,777,216 个浮点数（约 67 MB 显存）。如果模型有数十层，显存将瞬间枯竭！
+
+因此，无论是 PyTorch 还是 JAX，**反向传播计算的都不是完整的雅可比矩阵，而是向量-雅可比乘积（Vector-Jacobian Product, VJP）**：
+
+```
+VJP(v) = v × J
+```
+
+反向传播算子只需要接收上游传来的梯度向量 v，并直接输出下游所需的梯度向量，全程无需显式构建雅可比矩阵！
+
+---
+
+## 3. PyTorch：Tape-Based 动态计算图机制
+
+PyTorch 采用**磁带录制（Tape-based）**的动态图机制。
+
+### 3.1 前向过程发生了什么？
+当任意一个张量的 `requires_grad=True` 时：
+1. 每次调用算子（如加法、矩阵乘法），PyTorch 内部的 C++ 引擎（Autograd Engine）会在后台创建一个 `Node`（又称 `grad_fn`）；
+2. `grad_fn` 负责保存反向传播所需的中间激活值（Saved Tensors）；
+3. 动态构建出一个有向无环图（Directed Acyclic Graph, DAG）。
+
+```
+   x (requires_grad=True)
+   │
+   ▼
+[ MulBackward0 ] ◄── (保存了权重 w)
+   │
+   ▼
+   y
+   │
+   ▼
+[ AddBackward0 ] ◄── (保存了偏置 b)
+   │
+   ▼
+  loss
+```
+
+### 3.2 反向传播与图的生命周期
+当调用 `loss.backward()` 时：
+1. 引擎从 loss 开始，逆拓扑序遍历 DAG；
+2. 逐层调用每个节点的反向计算逻辑，将计算得到的梯度累加到对应张量的 `.grad` 属性上；
+3. **默认销毁机制**：一旦 `loss.backward()` 执行完毕，整张动态图及其缓存的中间激活值立即被释放（释放显存）。如果再次调用 `loss.backward()`，会抛出 RuntimeError，除非显式指定 `retain_graph=True`。
+
+```python
+import torch
+
+x = torch.tensor([2.0], requires_grad=True)
+w = torch.tensor([3.0], requires_grad=True)
+b = torch.tensor([1.0], requires_grad=True)
+
+y = x * w + b
+loss = y ** 2
+
+print("Loss 的反向溯源节点:", loss.grad_fn)         # <PowBackward0>
+print("上游中间节点:", loss.grad_fn.next_functions[0][0]) # <AddBackward0>
+
+loss.backward()
+print("x 的梯度:", x.grad) # 42.0 (计算过程: 2 * (x*w + b) * w = 2 * 7 * 3 = 42)
+```
+
+---
+
+## 4. JAX：函数式微分变换（Functional Transformation）
+
+JAX 不采用运行时录制磁带并保存有状态节点对象的做法，而是将**求导本身定义为一个纯高阶数学变换（Transform）**。
+
+### 4.1 函数式思维：对算子求导，而非对变量求导
+在 JAX 中，你永远不会看到 `x.requires_grad=True` 或 `loss.backward()`。
+
+```python
+import jax
+import jax.numpy as jnp
+
+# 1. 定义纯数学前向函数
+def forward(x, w, b):
+    y = x * w + b
+    return jnp.sum(y ** 2)
+
+# 2. 对函数应用 grad 变换，生成导数函数
+# argnums 指定对哪些参数求导（例如 0 代表 x，1 代表 w）
+grad_fn = jax.grad(forward, argnums=(0, 1))
+
+x = jnp.array([2.0])
+w = jnp.array([3.0])
+b = jnp.array([1.0])
+
+dx, dw = grad_fn(x, w, b)
+print("JAX 计算的 dx:", dx) # [42.]
+```
+
+### 4.2 JAXPR：JAX 的中间表示（IR）
+JAX 的自动微分是在其内部抽象语法表示 **JAXPR（JAX Primitive Representation）** 上完成的。
+JAX 会对函数进行一次轻量级的“追踪”（Tracing），生成由基础原子算子构成的有向计算图，然后直接对其进行数学变换：
+
+```python
+# 打印函数的 JAXPR 计算图
+print(jax.make_jaxpr(forward)(x, w, b))
+```
+
+输出的 JAXPR 清晰展示了纯函数的数据流向：
+```
+{ lambda ; a:f32[1] b:f32[1] c:f32[1]. let
+    d:f32[1] = mul a b
+    e:f32[1] = add d c
+    f:f32[1] = integer_pow[y=2] e
+    g:f32[] = reduce_sum[axes=(0,)] f
+  in (g,) }
+```
+
+---
+
+## 5. 核心架构对照总结
+
+| 关键特性 | PyTorch Autograd | JAX Grad |
+| :--- | :--- | :--- |
+| **心智模型** | 对象有状态追踪，原地图遍历 | 纯函数高阶算子变换 |
+| **触发方式** | `loss.backward()`，梯度原地累加至 `param.grad` | `grads = jax.grad(fn)(*args)`，返回新梯度结构 |
+| **内存开销** | 动态图节点对象持有中间变量引用 | 纯数据流描述，由编译器做死代码消除与显存复用 |
+| **高阶导数** | 多次调用 backward(create_graph=True) 较繁琐 | 纯函数嵌套：`jax.grad(jax.grad(f))` 极其优雅 |
+
+---
+
+## 本章小结
+
+1. 反向传播的工程本质是**向量-雅可比乘积（VJP）**，而非直接物化全量雅可比矩阵。
+2. PyTorch 的动态图是**命令式、基于运行追踪的 DAG**，生命周期默认在 backward 后结束。
+3. JAX 将微分视作**纯函数的代数变换**，通过 JAXPR 线性化图实现精准的梯度算子合成。

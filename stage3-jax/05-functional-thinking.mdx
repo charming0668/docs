@@ -1,10 +1,124 @@
 ---
 title: '第 5 章：JAX 函数式思维与约束'
-description: '纯函数原则、副作用规避、不可变数据与显式 PRNGKey 机制'
+description: '深入纯函数世界观、不可变张量更新法则、无副作用约束与显式 PRNGKey 机制'
 ---
 
-本章节正在系统撰写中，敬请期待！
+从 PyTorch 转向 JAX，最大的阻碍往往不是掌握语法，而是**思维范式的彻底颠覆**。PyTorch 的核心是面向对象与原地状态变化，而 JAX 则是彻底的纯函数式编程（Functional Programming）。
 
-<Note>
-第一阶段第 1 章已完整上线，欢迎优先阅读：[第 1 章：张量与显存物理现实](/stage1-foundations/01-tensor-memory)。
-</Note>
+---
+
+## 1. 纯函数（Pure Function）原则与避坑红线
+
+JAX 的核心编译器 XLA 要求：传递给 JAX 变换（如 `jit`、`grad`、`vmap`）的代码，**必须在数学上是纯函数**。
+
+### 1.1 纯函数的数学定义
+一个纯函数必须同时满足两个铁律：
+1. **确定性（Determinism）**：对于相同的输入，无论调用多少次、在何时何地调用，必须产生完全相同的输出。
+2. **无副作用（No Side-Effects）**：函数除了计算并返回返回值之外，不得改变外部世界的任何状态（例如修改全局变量、写入外部列表、写磁盘、发网络请求等）。
+
+### 1.2 JIT 编译中的“副作用失效”陷阱
+
+初学者最容易踩的深坑：在 JIT 函数内部依赖 Python 副作用。
+
+```python
+import jax
+import jax.numpy as jnp
+
+global_counter = 0
+
+@jax.jit
+def flawed_func(x):
+    global global_counter
+    global_counter += 1 # 危险：Python 外部状态副作用！
+    print(f"执行了追踪，当前计数: {global_counter}") # 危险：标准 IO 副作用！
+    return x * 2
+
+x = jnp.array([1.0])
+print("第 1 次执行:", flawed_func(x))
+print("第 2 次执行:", flawed_func(x))
+print("第 3 次执行:", flawed_func(x))
+print("最终全局计数:", global_counter)
+```
+
+**运行输出真实表现**：
+```
+执行了追踪，当前计数: 1
+第 1 次执行: [2.]
+第 2 次执行: [2.]
+第 3 次执行: [2.]
+最终全局计数: 1
+```
+
+**底层机理解释**：
+- `jax.jit` 第一次被调用时，会执行一次“追踪”（Tracing），生成 XLA 计算图。在追踪期间，Python 解释器执行了 `print` 和 `global_counter += 1`。
+- 但从第 2 次开始，JAX 发现输入类型与形状没变，**直接跳过所有 Python 代码，直接在 GPU 上执行已经编译好的 XLA 二进制机器码**！
+- 因此，写在 JIT 内部的 `print` 和全局状态修改再也不会被触发！
+
+<Warning>
+**JAX 编码红线**：绝不能在 JIT 函数中保留依赖业务逻辑的 print、全局状态修改或文件 IO。所有逻辑输入必须通过参数传入，所有结果必须通过返回值返回。
+</Warning>
+
+---
+
+## 2. 不可变数组（Immutable Arrays）与 arr.at 语法
+
+在 JAX 中，张量（`jax.Array`）是完全不可变的。原地写入（In-place assignment）会被直接拦截：
+
+```python
+x = jnp.zeros((3, 3))
+# x[0, 0] = 1.0  -> 抛出 TypeError: object does not support item assignment
+```
+
+JAX 提供了功能对等的函数式更新语法 `arr.at[...]`：
+
+| 意图 | PyTorch 写法 (有副作用) | JAX 写法 (纯函数返回新副本) |
+| :--- | :--- | :--- |
+| **覆盖赋值** | `x[0, :] = 1.0` | `x = x.at[0, :].set(1.0)` |
+| **累加操作** | `x[0, :] += 2.0` | `x = x.at[0, :].add(2.0)` |
+| **乘法累积** | `x[0, :] *= 3.0` | `x = x.at[0, :].multiply(3.0)` |
+| **条件置入** | `x[mask] = 0.0` | `x = x.at[mask].set(0.0)` |
+
+---
+
+## 3. 彻底告别隐式状态：JAX 显式随机数架构（PRNGKey）
+
+PyTorch 依赖全局隐式随机状态：
+```python
+# PyTorch 模式：后台隐式推进全局随机数种子指针
+torch.manual_seed(42)
+r1 = torch.randn(2)
+r2 = torch.randn(2) # 内部指针推进，r1 != r2
+```
+在大规模分布式并行与 JIT 静态图优化中，这种隐式全局状态是“并发竞态”和“不可复现”的温床。
+
+### 3.1 JAX 的 PRNGKey 哲学：随机性也是纯函数
+JAX 将伪随机数生成器（PRNG）设计为**确定性的纯数学状态**：
+
+```python
+import jax
+
+# 1. 创建显式主密钥 (Key)
+root_key = jax.random.key(seed=42)
+
+# 2. 永远通过 split 产生无依赖的新分支密钥
+key, subkey1, subkey2 = jax.random.split(root_key, num=3)
+
+# 3. 将不同的密钥明确传给不同的采样算子
+rand_a = jax.random.normal(subkey1, shape=(2, 2))
+rand_b = jax.random.normal(subkey2, shape=(2, 2))
+
+# 4. 再次需要随机数时，继续对 key 进行拆分
+key, new_subkey = jax.random.split(key)
+```
+
+**优势**：
+- **绝对可复现性**：无论多卡并行调度顺序如何变化，只要密钥分支树一致，随机结果 100% 比对一致；
+- **便于并行映射**：可以通过 `jax.vmap` 批量并行生成千万个独立的随机密钥。
+
+---
+
+## 本章小结
+
+1. JAX 的世界是**纯函数的数学映射**，JIT 内部不能依赖 Python 副作用或动态解释逻辑；
+2. 数组不可变性通过 `x.at[...].set(...)` 维持，XLA 底层自动做 Buffer 显存复用；
+3. 随机数生成完全显式化，通过不可变的 `key` 与 `jax.random.split` 树状派生保证绝对的可重现性。

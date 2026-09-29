@@ -1,10 +1,129 @@
 ---
 title: '第 3 章：PyTorch 核心模块与生命周期'
-description: '深入理解 nn.Module、参数注册、Hook 与显存优化机制'
+description: '源码视角拆解 nn.Module 内部机制、参数/缓冲区别、Hook 拦截与训练循环显存优化'
 ---
 
-本章节正在系统撰写中，敬请期待！
+在掌握了张量物理布局与动态图自动微分之后，我们进入工业级框架的工程化组织架构。本章从源码视角拆解 PyTorch 最核心的基类：`torch.nn.Module`，以及写出生产级高效训练循环必须注意的底层细节。
 
-<Note>
-第一阶段第 1 章已完整上线，欢迎优先阅读：[第 1 章：张量与显存物理现实](/stage1-foundations/01-tensor-memory)。
-</Note>
+---
+
+## 1. 深入 nn.Module 底层数据结构
+
+很多初学者认为 `nn.Module` 只是一个普通的 Python 类。实际上，它重写了属性访问机制（`__setattr__` 和 `__getattr__`），在底层维护了数个有序字典：
+
+```python
+# nn.Module 核心内部状态字典结构
+self._modules = OrderedDict()       # 存储子模块 (如 self.conv1, self.linear)
+self._parameters = OrderedDict()    # 存储可学习参数 (必须参与反向传播)
+self._buffers = OrderedDict()       # 存储非参数张量 (不参与梯度更新，但需持久化)
+self._forward_hooks = OrderedDict() # 前向钩子函数
+self._backward_hooks = OrderedDict()# 反向钩子函数
+```
+
+### 1.1 Parameter vs Buffer 的严格界定
+
+| 属性类型 | 声明方式 | 是否参与反向梯度计算 | 是否保存在 state_dict 中 | 典型应用场景 |
+| :--- | :--- | :--- | :--- | :--- |
+| **Parameter** | `nn.Parameter(tensor)` | 是 (`requires_grad=True`) | 是 | 卷积核权重、全连接层偏置 |
+| **Buffer** | `self.register_buffer('name', tensor)` | 否 (`requires_grad=False`) | 是 | BatchNorm 的均值/方差、位置编码 (Position Embedding) |
+| **普通成员变量** | `self.x = tensor` | 否 | **否 (容易丢失！)** | 临时变量、只读常量 |
+
+```python
+import torch
+import torch.nn as nn
+
+class CustomLayer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # 1. 自动注册到 self._parameters
+        self.weight = nn.Parameter(torch.randn(4, 4))
+        
+        # 2. 自动注册到 self._buffers，随模型移动到 GPU，并包含在 state_dict 中
+        self.register_buffer("running_mean", torch.zeros(4))
+        
+        # 3. 错误示范：普通属性不会被 .to(device) 转移，也不会被保存！
+        self.temp_mask = torch.ones(4)
+
+layer = CustomLayer()
+layer.to("cuda" if torch.cuda.is_available() else "cpu")
+print("Buffer 是否在 GPU 上:", layer.running_mean.device)
+```
+
+---
+
+## 2. 深入理解 Hook 机制：无侵入式调试与特征提取
+
+Hook 是 PyTorch 最强大的调试和扩展机制，允许你在不修改网络原始源码的情况下，拦截中间特征图与梯度流。
+
+### 2.1 Forward Hook：提取中间层特征图
+```python
+activations = {}
+
+def get_activation(name):
+    def hook(model, input, output):
+        # 缓存中间特征
+        activations[name] = output.detach()
+    return hook
+
+# 为特定层注册前向钩子
+layer.weight_layer = nn.Linear(4, 4)
+handle = layer.weight_layer.register_forward_hook(get_activation("linear_out"))
+
+# 运行前向
+# output = layer(x)
+
+# 及时移除钩子避免显存泄漏
+handle.remove()
+```
+
+### 2.2 Tensor Hook：拦截并修正梯度
+可以在张量反向传播经过时，原地对梯度进行裁剪或探针打印：
+```python
+x = torch.randn(2, 2, requires_grad=True)
+y = x * 2
+
+# 注册反向梯度 Hook
+y.register_hook(lambda grad: grad * 0.5) # 在梯度回传经过 y 时缩小一半
+```
+
+---
+
+## 3. 高效训练循环黄金法则与显存排雷
+
+编写训练循环时，以下三处细节直接决定训练吞吐与显存瓶颈：
+
+### 3.1 优化器清零：为什么推荐 set_to_none=True？
+传统写法：
+```python
+optimizer.zero_grad() # 底层：遍历每个 param，执行 param.grad.zero_() 原地写 0 内存
+```
+高效写法（PyTorch 1.7+ 强烈推荐）：
+```python
+optimizer.zero_grad(set_to_none=True)
+```
+**底层性能收益**：
+1. **省去显存写 0 开销**：直接将 `param.grad` 设为 `None`，无需向显存写入全零浮点数；
+2. **反向传播算子优化**：反向传播计算梯度时，从“读取旧梯度 + 累加新梯度”退化为“直接分配写入”，减少一次显存访存。
+
+### 3.2 损失记录中的显存泄漏：loss.item()
+初学者经典 Bug：
+```python
+total_loss = 0.0
+for x, y in dataloader:
+    loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    # 错误写法：保留了完整的动态计算图引用，导致整轮 Epoch 显存持续暴涨直达 OOM！
+    total_loss += loss 
+    
+    # 正确写法：提取纯 Python 标量数值
+    total_loss += loss.item()
+```
+
+---
+
+## 本章小结
+
+1. `nn.Module` 靠重写属性机制管理 Parameter、Buffer 与 Submodules；
+2. 凡需保存在 Checkpoint 中且随模型进行设备搬运的非训练张量，必须使用 `register_buffer`；
+3. 训练循环中坚持使用 `zero_grad(set_to_none=True)` 与 `loss.item()`，避免隐形显存泄漏。

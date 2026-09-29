@@ -1,10 +1,102 @@
 ---
 title: '第 11 章：工业级项目实战——以 OpenPi 为例'
-description: '真实机器人大模型中 JAX 与 PyTorch 的选型、转换与架构剖析'
+description: '拆解 Physical Intelligence 的 π₀/π₀.₅ 机器人大模型架构中 JAX 与 PyTorch 的选型与转换全流程'
 ---
 
-本章节正在系统撰写中，敬请期待！
+在具身智能（Embodied AI）与物理机器人领域，**Physical Intelligence 推出的 OpenPi（π₀ 与 π₀.₅）** 是当前最具代表性的开源视觉-语言-动作大模型（VLA）。令人瞩目的是，OpenPi 仓库**同时提供了完整的 JAX 与 PyTorch 两套独立实现**。
 
-<Note>
-第一阶段第 1 章已完整上线，欢迎优先阅读：[第 1 章：张量与显存物理现实](/stage1-foundations/01-tensor-memory)。
-</Note>
+本章通过拆解 OpenPi 真实源码，为你展现工业界顶级团队在 JAX 与 PyTorch 之间的真实抉择。
+
+---
+
+## 1. OpenPi 架构概览与技术选型定位
+
+OpenPi 由三大核心组件构成：
+1. **视觉骨干（Vision Backbone）**：SigLIP / ViT，提取多机位视角图像特征；
+2. **多模态语言骨干（VLM Backbone）**：PaliGemma，理解自然语言任务指令；
+3. **动作生成专家（Action Expert）**：基于 Flow Matching（流匹配扩散模型）的 Gemma 解码器，预测高频平滑的机械臂动作序列。
+
+```
+RGB 图像 ────────► [ SigLIP ViT ] ──┐
+                                     ├──► [ PaliGemma VLM ] ──► [ Gemma Action Expert ] ──► 机械臂动作序列
+语言指令 ("拿苹果") ─────────────────┘
+```
+
+### 1.1 双框架在 OpenPi 中的分工
+- **JAX 实现（基准核心）**：全套网络基于 **Flax NNX** 原生手写（`src/openpi/models/`）。拥有预训练、全量微调、π₀-FAST 离散动作自回归、LoRA 微调以及原生 FSDP 多卡扩展能力。
+- **PyTorch 实现（部署与生态扩展）**：基于 Hugging Face **transformers** 现有骨干组合二次封装（`src/openpi/models_pytorch/`）。重点服务于广大机器人工程师已有的 PyTorch ROS 驱动与下游快速适配。
+
+---
+
+## 2. Checkpoint 格式与跨框架模型转换机制
+
+OpenPi 官方提供了 `examples/convert_jax_model_to_pytorch.py` 脚本，揭示了两大框架在模型权重持久化上的本质区别。
+
+### 2.1 存储机制对比
+- **JAX 权重存储**：使用 **Orbax（`orbax.checkpoint`）**。其本质是一个深层嵌套的目录树，参数名与 PyTree 的层级一一对应；
+- **PyTorch 权重存储**：使用 **Hugging Face `safetensors`**。扁平化的键值映射，键名以点号分隔（例如 `paligemma.model.layers.0.self_attn.q_proj.weight`）。
+
+### 2.2 转换实操：从 JAX 转换为 PyTorch
+```bash
+# 使用 openpi 官方脚本一键转换权重
+python examples/convert_jax_model_to_pytorch.py     --checkpoint_dir ~/.cache/openpi/checkpoints/pi0_droid     --output_path ~/.cache/openpi/checkpoints/pi0_droid_pytorch
+```
+
+**转换核心逻辑**：
+1. 用 `orbax` 读取 JAX 树状参数；
+2. 针对 Gemma 的权重切片（如 Query, Key, Value 权重张量的合并与切分）进行形状重排；
+3. 将 Flax NNX 的命名空间映射到 Hugging Face Transformers 的属性名；
+4. 将 Numpy 数组转换为 PyTorch Float32/BF16 Tensor，并用 `safetensors.torch.save_model` 写入磁盘。
+
+---
+
+## 3. 为什么 PyTorch 实现需要打补丁？
+
+在 OpenPi 源码的 `src/openpi/models_pytorch/transformers_replace/` 目录下，包含了一组必须覆盖到官方 `transformers` 库中的定制代码。这是因为官方库缺少机器人流匹配模型所需的三个关键特性：
+
+1. **AdaRMS（自适应 RMS 归一化）**：流匹配扩散模型需要将当前采样时间步（Timestep t）作为条件向量注入到每一层。OpenPi 在归一化层中注入了时间步的自适应投影；
+2. **严格的激活值精度控制**：防止在混合精度下敏感层发生溢出；
+3. **KV Cache 冻结复用**：在流匹配多步去噪推演过程中，视觉与文本的 KV Cache 保持恒定，无需在去噪循环中反复被更新。
+
+---
+
+## 4. 统一上层 Policy 抽象（API 对齐）
+
+为了让上层机器人推理控制器（如 ALOHA 机械臂驱动）无需关心底层到底是 JAX 还是 PyTorch，OpenPi 设计了精巧的自动分发工厂函数（`src/openpi/policies/policy_config.py`）：
+
+```python
+# 核心源码机制剖析：
+def create_trained_policy(train_config, checkpoint_dir):
+    # 自动探测权重目录下是否存在 model.safetensors
+    weight_path = os.path.join(checkpoint_dir, "model.safetensors")
+    is_pytorch = os.path.exists(weight_path)
+
+    if is_pytorch:
+        # 加载 PyTorch 模型
+        model = train_config.model.load_pytorch(train_config, weight_path)
+    else:
+        # 加载 JAX Orbax 模型
+        model = train_config.model.load(_model.restore_params(checkpoint_dir / "params"))
+
+    # 包装为完全统一的 Policy 抽象接口
+    return Policy(model, is_pytorch=is_pytorch)
+```
+
+上层机器人控制代码：
+```python
+# 无论底层是 JAX 还是 PyTorch，推理代码 100% 保持一致！
+policy = create_trained_policy(config, checkpoint_dir)
+actions = policy.infer(observation)["actions"]
+```
+
+---
+
+## 5. 工业级框架选型终极总结指南
+
+| 场景需求 | 首选框架 | 核心理由 |
+| :--- | :--- | :--- |
+| **超大模型预训练 / 极速前沿创新** | **JAX / Flax NNX** | 原生静态 XLA 优化、FSDP/SPMD 优雅多维切分、无状态确定性利于长周期复现 |
+| **机器人与端侧实体部署 / 硬件在环** | **PyTorch** | 繁荣的硬件支持生态、与 ROS / OpenCV / ONNX 等下游工业管线无缝衔接 |
+| **学术实验与快速原型** | **PyTorch (配合 2.0 compile)** | 生态库庞大、社区开源模型最多、动态调试极其直观方便 |
+
+至此，恭喜你完整学完了《深度学习与科学计算框架系统指南》的全部核心篇章！
