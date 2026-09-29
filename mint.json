@@ -1,0 +1,58 @@
+{
+  "$schema": "https://mintlify.com/schema.json",
+  "name": "深度学习与科学计算框架系统指南",
+  "logo": {
+    "dark": "/logo/dark.svg",
+    "light": "/logo/light.svg"
+  },
+  "favicon": "/favicon.svg",
+  "colors": {
+    "primary": "#0D9373",
+    "light": "#07C98B",
+    "dark": "#0D9373"
+  },
+  "navigation": [
+    {
+      "group": "入门概览",
+      "pages": [
+        "index"
+      ]
+    },
+    {
+      "group": "第一阶段：底层基石与心智重塑",
+      "pages": [
+        "stage1-foundations/01-tensor-memory",
+        "stage1-foundations/02-autograd"
+      ]
+    },
+    {
+      "group": "第二阶段：PyTorch 深入与进阶",
+      "pages": [
+        "stage2-pytorch/03-basics",
+        "stage2-pytorch/04-advanced"
+      ]
+    },
+    {
+      "group": "第三阶段：JAX 与函数式科学计算",
+      "pages": [
+        "stage3-jax/05-functional-thinking",
+        "stage3-jax/06-transformations",
+        "stage3-jax/07-pytree-sharding"
+      ]
+    },
+    {
+      "group": "第四阶段：Flax NNX 架构解析",
+      "pages": [
+        "stage4-flax-nnx/08-linen-vs-nnx",
+        "stage4-flax-nnx/09-nnx-architecture"
+      ]
+    },
+    {
+      "group": "第五阶段：工程对照实战",
+      "pages": [
+        "stage5-practices/10-minimal-experiments",
+        "stage5-practices/11-openpi-case-study"
+      ]
+    }
+  ]
+}
