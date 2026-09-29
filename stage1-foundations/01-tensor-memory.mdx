@@ -1,0 +1,220 @@
+---
+title: '第 1 章：张量与显存物理现实'
+description: '从物理内存视角剖析张量底层布局、步长机制、内存视图与 GPU 访存性能瓶颈'
+---
+
+在深度学习的日常开发中，我们习惯于把张量（Tensor）当作高维矩阵进行数学运算。然而在工程底层，**计算机硬件并不存在真正意义上的“多维数组”**。现代计算机内存与 GPU 显存，本质上都只是一段**一维线性寻址的物理字节块**。
+
+理解张量如何被映射到物理存储，是深入掌握 PyTorch、JAX 及各类编译优化框架（如 XLA、Triton、TorchDynamo）的第一块基石。
+
+---
+
+## 1. 张量的底层架构：Storage、Shape 与 Strides
+
+一个完整的张量对象，在逻辑上由两部分构成：
+1. **数据区（Storage / Buffer）**：一块连续分配的一维内存缓冲区，真实存放所有元素数据。
+2. **元数据区（Metadata）**：描述这块内存如何被解释的高维“透镜”，包括 **数据类型（dtype）**、**维度（shape）**、**步长（strides）** 和 **偏移量（storage_offset）**。
+
+```
+张量逻辑视图 2x3 矩阵:
+[[1, 2, 3],
+ [4, 5, 6]]
+
+底层一维连续 Storage (物理内存):
+| 1 | 2 | 3 | 4 | 5 | 6 |
+  0   1   2   3   4   5   (物理索引)
+```
+
+### 1.1 步长（Strides）的寻址代数公式
+
+步长定义了**在某个特定维度上索引增加 1 时，底层一维物理存储指针需要向前跳跃的元素个数**。
+
+对于一个 $N$ 维张量，逻辑坐标为 $(i_0, i_1, dots, i_{N-1})$ 的元素，其在物理 Storage 中的扁平索引计算公式为：
+
+$$
+	ext{Physical Index} = 	ext{storage_offset} + sum_{k=0}^{N-1} i_k 	imes 	ext{strides}[k]
+$$
+
+<Tabs>
+  <Tab title="PyTorch 观察 Storage 与 Strides">
+    ```python
+    import torch
+
+    # 创建一个 2x3 的张量
+    x = torch.tensor([[1, 2, 3], 
+                      [4, 5, 6]], dtype=torch.float32)
+
+    print("Shape:", x.shape)        # torch.Size([2, 3])
+    print("Strides:", x.stride())    # (3, 1) -> 沿第0维走一步跳3个元素，沿第1维走一步跳1个元素
+    print("Storage:", x.untyped_storage().tolist()) # [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    ```
+  </Tab>
+  <Tab title="JAX 视角的内存与设计">
+    ```python
+    import jax
+    import jax.numpy as jnp
+
+    x = jnp.array([[1, 2, 3], 
+                   [4, 5, 6]], dtype=jnp.float32)
+
+    print("Shape:", x.shape)        # (2, 3)
+    print("Device:", x.devices())   # 驻留在指定硬件设备的 Buffer 上
+    # 注意：JAX 屏蔽了底层 Storage 细节，用户不能直接拿到可变指针，
+    # 物理布局交由 XLA 编译器统一决策与排布。
+    ```
+  </Tab>
+</Tabs>
+
+### 1.2 视图机制（View）与零拷贝（Zero-Copy）
+
+因为有元数据的存在，对张量做诸如切片（Slicing）、转置（Transpose）、变形（Reshape）时，**完全不需要重新拷贝底层物理数据**，只需要生成一份新的元数据（新的 Shape 与 Strides），并指向同一个底层 Storage 即可。
+
+```python
+import torch
+
+x = torch.arange(6)          # Storage: [0, 1, 2, 3, 4, 5], stride: (1,)
+y = x.view(2, 3)             # 共享 Storage，新 stride: (3, 1)
+z = y.t()                    # 转置，共享 Storage，新 stride: (1, 3)
+
+# 验证内存是否共享
+print(y.data_ptr() == x.data_ptr())  # True
+print(z.data_ptr() == x.data_ptr())  # True
+```
+
+<Note>
+**零拷贝的威力**：无论模型权重有多大（例如 70B 参数的大语言模型），转置或切片等视图操作的耗时仅为微秒级（$O(1)$ 复杂度），因为它只分配了不到 100 字节的元数据描述符。
+</Note>
+
+---
+
+## 2. 连续性（Contiguity）与内存拷贝开销
+
+### 2.1 什么是 C-Contiguous（行优先连续）？
+
+如果一个张量在内存中的物理存储顺序与按行优先遍历（从最右侧维度向左递增）的访问顺序完全一致，则该张量是**连续的（Contiguous）**。
+
+数学判别法则：对于维度 $k$，满足：
+$$
+	ext{strides}[k] = 	ext{strides}[k+1] 	imes 	ext{shape}[k+1]
+$$
+且最内层维度 $	ext{strides}[N-1] = 1$。
+
+### 2.2 为什么 Transpose 之后 View 会报错？
+
+许多初学者会遇到以下经典错误：
+
+```python
+x = torch.randn(2, 3)
+y = x.t()           # shape: (3, 2), strides: (1, 3) -> 此时 y 不再连续！
+z = y.view(6)       # 抛出 RuntimeError: view size is not compatible with input tensor's size and stride
+```
+
+**报错根因剖析**：
+`view()` 操作要求目标形状必须能够仅通过修改元数据的 `strides` 映射到底层原有一维连续存储中。但当张量经过转置后，内存物理排列依然是原始顺序，而逻辑遍历顺序已经打乱。此时若想把它展开成 6 个连续元素，底层的物理内存索引并不是单调递增的（跳跃步长不均匀），因此纯靠单组步长元数据无法完成映射。
+
+**解决方案对比**：
+* **`y.contiguous().view(6)`**：显式分配一块新的连续显存，把打乱的数据按逻辑顺序物理拷贝过去，恢复连续性。
+* **`y.reshape(6)`**：PyTorch 提供的高级封装。如果原张量连续，等价于 `view()`（零拷贝）；若不连续，自动在后台调用 `contiguous()`（发生数据深拷贝）。
+
+<Warning>
+**隐形性能杀手**：频繁无意识地使用 `reshape()` 替代 `view()`，可能会在训练前向/反向传播中引入大量无意的显存分配与全局内存拷贝，造成严重的带宽浪费！
+</Warning>
+
+---
+
+## 3. 原地修改（In-Place）vs 函数式不可变（Immutable）
+
+在处理张量数据时，PyTorch 与 JAX 呈现了完全不同的架构取向：
+
+### 3.1 PyTorch 的原地修改与 Autograd 冲突
+
+PyTorch 支持 `x[0] = 1.0` 或 `x.add_()` 等原地修改算子。虽然这能节省内存开销，但在自动微分中隐藏着极大风险：
+
+```python
+import torch
+
+a = torch.tensor([1.0, 2.0], requires_grad=True)
+b = a * 2
+b.add_(1.0)  # 原地修改了 b！
+loss = b.sum()
+# 若反向传播需要用到被修改前的 b，Autograd 的 Version Counter 会报错：
+# RuntimeError: one of the variables needed for gradient computation has been modified by an inplace operation
+```
+
+### 3.2 JAX 的不可变数组与 Buffer Donation
+
+JAX 继承了函数式纯函数哲学：**一切张量皆为不可变对象**。
+
+```python
+import jax.numpy as jnp
+
+x = jnp.zeros((3, 3))
+# 语法错误：x[0, 0] = 1.0 不允许！
+
+# 正确语法：生成新数组
+x_new = x.at[0, 0].set(1.0)
+```
+
+初学者常常疑惑：*“每次修改都返回新数组，岂不是会造成成倍的显存分配与性能雪崩？”*
+
+**底层的 XLA 编译器优化解答**：
+1. **纯函数无副作用**：编译器能 100% 确定原数组在之后是否还会被读取。
+2. **Buffer Donation（显存缓冲区借调）**：在 `jax.jit` 编译下，XLA 会进行活跃度分析（Liveness Analysis）。如果判定旧数组在更新后不再被访问，XLA 会直接在底层将旧显存块借调给新结果，**物理执行仍然是原地覆盖，但在逻辑上保持纯函数的确定性**！
+
+---
+
+## 4. GPU 硬件现实：计算密集型 vs 访存密集型
+
+编写高性能深度学习代码，必须理解 GPU 物理计算架构。
+
+### 4.1 物理带宽瓶颈与阶梯
+
+```
+[CPU 主存 DRAM] 
+       │ PCIe 4.0/5.0 (~32 - 64 GB/s) -> 极窄的高速公路
+       ▼
+[GPU 显存 HBM/GDDR] (~1 - 3 TB/s)      -> 片外全局显存 (Global Memory)
+       │ On-Chip Data Bus (~10+ TB/s)  -> 片上极宽通道
+       ▼
+[GPU SRAM / L1 / Register] (~20+ TB/s) -> 计算核心旁的高速缓存
+       │
+[Tensor Core / CUDA Core] (数百 TFLOPS 纯算力)
+```
+
+### 4.2 两类算子的本质区别
+
+| 类型 | 典型算子 | 性能瓶颈 | 优化策略 |
+| :--- | :--- | :--- | :--- |
+| **计算密集型 (Compute-Bound)** | 矩阵乘法（GEMM）、标准卷积（Conv） | 算力单元吞吐量（TFLOPS） | 提高 Tensor Core 利用率、增大 Batch Size |
+| **访存密集型 (Memory-Bound)** | LayerNorm, Softmax, GELU, Elementwise 算子 | 显存带宽吞吐量（GB/s / TB/s） | **算子融合（Kernel Fusion）**，减少显存读写 |
+
+### 4.3 为什么算子融合（Kernel Fusion）是现代编译器的核心？
+
+以一个最普通的激活层为例：$y = 	ext{GELU}(x + b)$。
+
+* **未融合执行模式（PyTorch Eager）**：
+  1. 从全局显存读 $x$ 和 $b$，计算 $x+b$；
+  2. 将临时结果写回全局显存；
+  3. 再次从全局显存读取临时结果，计算 $	ext{GELU}$；
+  4. 将最终结果写回全局显存。
+  > 产生两次冗余的全局显存往返（Round-trip），计算核心大部分时间在饥饿等待数据搬运！
+
+* **算子融合模式（JAX XLA / PyTorch 2.0 Inductor / FlashAttention）**：
+  将加法和 GELU 合并在同一个 GPU Kernel 中。数据从显存载入 SRAM 后，连续完成加法和 GELU 计算，只在最后将结果写回一次显存。
+
+<Tip>
+**总结与思考**：
+这也是为什么 JAX 天然具备速度优势（默认走 XLA 编译融合），以及 PyTorch 从 2.0 推出 `torch.compile` 的核心原因——**把大量访存密集型操作打包融合，将硬件从内存带宽瓶颈中解放出来**。
+</Tip>
+
+---
+
+## 本章小结与自测
+
+1. **核心概念自查**：
+   - 什么是张量的 Strides？如何用 Strides 计算坐标为 $(1, 2)$ 处的扁平索引？
+   - 为什么对张量执行 `.t()` 后，再使用 `.view()` 会失败，而 `.reshape()` 却可以？
+   - JAX 强制不可变数组，为什么在编译后不会导致显存爆炸？
+2. **下一章预告**：
+   理解了显存与张量的物理排布后，下一章我们将深入**自动微分（Autograd）机制**：探讨反向传播时动态计算图如何追踪这些张量，以及 JAX 的函数式 AST 变换与 PyTorch 的动态图在底层究竟有何异同。
+

@@ -1,72 +1,61 @@
 {
   "$schema": "https://mintlify.com/docs.json",
   "theme": "mint",
-  "name": "Mintlify Starter Kit",
+  "name": "深度学习与科学计算框架系统指南",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
+    "primary": "#0D9373",
+    "light": "#07C98B",
+    "dark": "#0D9373"
   },
   "favicon": "/favicon.svg",
   "navigation": {
     "pages": [
       {
-        "group": "Getting Started",
+        "group": "入门概览",
         "pages": [
-          "index",
-          "quickstart"
+          "index"
+        ]
+      },
+      {
+        "group": "第一阶段：底层基石与心智重塑",
+        "pages": [
+          "stage1-foundations/01-tensor-memory",
+          "stage1-foundations/02-autograd"
+        ]
+      },
+      {
+        "group": "第二阶段：PyTorch 深入与进阶",
+        "pages": [
+          "stage2-pytorch/03-basics",
+          "stage2-pytorch/04-advanced"
+        ]
+      },
+      {
+        "group": "第三阶段：JAX 与函数式科学计算",
+        "pages": [
+          "stage3-jax/05-functional-thinking",
+          "stage3-jax/06-transformations",
+          "stage3-jax/07-pytree-sharding"
+        ]
+      },
+      {
+        "group": "第四阶段：Flax NNX 架构解析",
+        "pages": [
+          "stage4-flax-nnx/08-linen-vs-nnx",
+          "stage4-flax-nnx/09-nnx-architecture"
+        ]
+      },
+      {
+        "group": "第五阶段：工程对照实战",
+        "pages": [
+          "stage5-practices/10-minimal-experiments",
+          "stage5-practices/11-openpi-case-study"
         ]
       }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
+    ]
   },
   "logo": {
     "light": "/logo/light.svg",
     "dark": "/logo/dark.svg"
-  },
-  "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:support@mintlify.com"
-      }
-    ],
-    "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://app.mintlify.com"
-    }
-  },
-  "contextual": {
-    "options": [
-      "copy",
-      "view",
-      "chatgpt",
-      "claude",
-      "perplexity",
-      "mcp",
-      "cursor",
-      "vscode"
-    ]
-  },
-  "footer": {
-    "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
-    }
   }
 }
